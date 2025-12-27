@@ -1,10 +1,11 @@
+# .github/workflows/release_ci.yml
 name: Pilipala Release
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "可选：手动触发时填写 tag（例如 v1.2.3）。不填只产物不发 Release"
+        description: "手动触发时可填 tag（例如 v1.2.3）。不填则只产物不发 Release"
         required: false
         type: string
   push:
@@ -15,7 +16,8 @@ permissions:
   contents: write
 
 env:
-  FLUTTER_VERSION: "3.19.6"
+  FLUTTER_VERSION: "3.27.4"
+  ANDROID_COMPILE_SDK: "36"
 
 jobs:
   android:
@@ -29,6 +31,7 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
+          cache: gradle
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -40,53 +43,115 @@ jobs:
       - name: Pub get
         run: flutter pub get
 
-      - name: Decode jks
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      - name: Force compileSdk to 36
         run: |
-          echo "$KEYSTORE_BASE64" | base64 -d > android/app/vvex.jks
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("android/app/build.gradle")
+          if not p.exists():
+            raise SystemExit("android/app/build.gradle not found")
+          s = p.read_text(encoding="utf-8")
 
-      - name: Build APK
-        run: |
-          flutter build apk --release --split-per-abi
-          flutter build apk --release
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          # compileSdk / compileSdkVersion
+          s2 = s
+          s2 = re.sub(r'compileSdkVersion\s+\d+', 'compileSdkVersion 36', s2)
+          s2 = re.sub(r'compileSdkVersion\s+flutter\.compileSdkVersion', 'compileSdkVersion 36', s2)
+          s2 = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 36', s2)
+          s2 = re.sub(r'compileSdk\s*=\s*flutter\.compileSdkVersion', 'compileSdk = 36', s2)
+          s2 = re.sub(r'compileSdk\s+\d+', 'compileSdk 36', s2)
 
-      - name: Get version
+          # targetSdk (optional but generally safe)
+          s2 = re.sub(r'targetSdkVersion\s+\d+', 'targetSdkVersion 36', s2)
+          s2 = re.sub(r'targetSdkVersion\s+flutter\.targetSdkVersion', 'targetSdkVersion 36', s2)
+          s2 = re.sub(r'targetSdk\s*=\s*\d+', 'targetSdk = 36', s2)
+          s2 = re.sub(r'targetSdk\s*=\s*flutter\.targetSdkVersion', 'targetSdk = 36', s2)
+          s2 = re.sub(r'targetSdk\s+\d+', 'targetSdk 36', s2)
+
+          if s2 != s:
+            p.write_text(s2, encoding="utf-8")
+            print("Patched android/app/build.gradle (compileSdk/targetSdk -> 36)")
+          else:
+            print("No changes needed in android/app/build.gradle")
+          PY
+
+      - name: Resolve tag/version
         id: ver
         env:
           INPUT_TAG: ${{ inputs.release_tag }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
+            TAG="${GITHUB_REF_NAME}"
           elif [[ -n "$INPUT_TAG" ]]; then
             TAG="$INPUT_TAG"
           else
             TAG="manual-${GITHUB_SHA::7}"
           fi
           VERSION="${TAG#v}"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Decode keystore (optional)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [[ -n "$KEYSTORE_BASE64" ]]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > android/app/vvex.jks
+            echo "Keystore written."
+          else
+            echo "No KEYSTORE_BASE64 provided; will build debug."
+          fi
+
+      - name: Build APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [[ -n "$KEYSTORE_BASE64" ]]; then
+            flutter build apk --release --split-per-abi
+            flutter build apk --release
+          else
+            flutter build apk --debug --split-per-abi
+            flutter build apk --debug
+          fi
 
       - name: Rename APKs
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           OUT="build/app/outputs/flutter-apk"
+          mkdir -p "$OUT/out"
+
+          shopt -s nullglob
           for f in "$OUT"/*.apk; do
-            [ -e "$f" ] || continue
-            b="$(basename "$f")"
-            mv "$f" "$OUT/Pili-${b%.apk}-$VERSION.apk"
+            base="$(basename "$f")"
+            # Examples:
+            # app-arm64-v8a-release.apk -> Pili-arm64-v8a-<ver>.apk
+            # app-release.apk          -> Pili-universal-<ver>.apk
+            # app-debug.apk            -> Pili-universal-debug-<ver>.apk
+            if [[ "$base" =~ ^app-(.*)-release\.apk$ ]]; then
+              abi="${BASH_REMATCH[1]}"
+              mv "$f" "$OUT/out/Pili-${abi}-${VERSION}.apk"
+            elif [[ "$base" == "app-release.apk" ]]; then
+              mv "$f" "$OUT/out/Pili-universal-${VERSION}.apk"
+            elif [[ "$base" =~ ^app-(.*)-debug\.apk$ ]]; then
+              abi="${BASH_REMATCH[1]}"
+              mv "$f" "$OUT/out/Pili-${abi}-debug-${VERSION}.apk"
+            elif [[ "$base" == "app-debug.apk" ]]; then
+              mv "$f" "$OUT/out/Pili-universal-debug-${VERSION}.apk"
+            else
+              mv "$f" "$OUT/out/Pili-${base%.apk}-${VERSION}.apk"
+            fi
           done
+
+          ls -lah "$OUT/out"
 
       - name: Upload Android artifacts
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          path: build/app/outputs/flutter-apk/Pili-*.apk
+          path: build/app/outputs/flutter-apk/out/*.apk
           if-no-files-found: error
 
   ios:
@@ -105,6 +170,22 @@ jobs:
       - name: Pub get
         run: flutter pub get
 
+      - name: Resolve tag/version
+        id: ver
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="manual-${GITHUB_SHA::7}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Build IPA (no codesign)
         run: |
           flutter build ios --release --no-codesign
@@ -113,28 +194,13 @@ jobs:
           cp -R build/ios/iphoneos/Runner.app Payload/Runner.app
           (cd Payload && zip -r ../app.ipa Runner.app)
 
-      - name: Get version
-        id: ver
-        env:
-          INPUT_TAG: ${{ inputs.release_tag }}
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-          elif [[ -n "$INPUT_TAG" ]]; then
-            TAG="$INPUT_TAG"
-          else
-            TAG="manual-${GITHUB_SHA::7}"
-          fi
-          VERSION="${TAG#v}"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       - name: Rename IPA
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           mkdir -p build
-          mv app.ipa "build/Pili-$VERSION.ipa"
+          mv app.ipa "build/Pili-${VERSION}.ipa"
+          ls -lah build
 
       - name: Upload iOS artifacts
         uses: actions/upload-artifact@v4
@@ -146,32 +212,40 @@ jobs:
   release:
     runs-on: ubuntu-latest
     needs: [android, ios]
-    if: ${{ startsWith(github.ref, 'refs/tags/') || inputs.release_tag != '' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
     steps:
-      - name: Download artifacts
+      - name: Download Android artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: "*-apk|*-ipa"
+          name: android-apk
           path: artifacts
-          merge-multiple: true
 
-      - name: Get tag
-        id: tag
+      - name: Download iOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-ipa
+          path: artifacts
+
+      - name: Resolve tag/version
+        id: ver
         env:
           INPUT_TAG: ${{ inputs.release_tag }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
+            TAG="${GITHUB_REF_NAME}"
           else
             TAG="$INPUT_TAG"
           fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Publish Release
+      - name: Publish GitHub Release
         uses: ncipollo/release-action@v1
         with:
-          tag: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
-          artifacts: artifacts/**/*
+          tag: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          commit: ${{ github.sha }}
           allowUpdates: true
-          token: ${{ secrets.GIT_TOKEN }}
+          artifacts: artifacts/**/*
+          token: ${{ secrets.GIT_TOKEN || github.token }}
