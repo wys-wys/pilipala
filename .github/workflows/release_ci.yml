@@ -16,8 +16,8 @@ permissions:
   contents: write
 
 env:
-  FLUTTER_VERSION: "3.24.1"
-  ANDROID_COMPILE_SDK: "36"
+  FLUTTER_VERSION: " 3.24.5"
+  ANDROID_COMPILE_SDK: "34"
 
 jobs:
   android:
