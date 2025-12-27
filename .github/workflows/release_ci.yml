@@ -1,158 +1,191 @@
 name: Pilipala Release
 
-
-# action事件触发
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "手动触发时填写 Tag（例如 v1.2.3）"
+        required: true
+        default: "v0.0.0"
   push:
     tags:
       - "v*.*.*"
 
-# 可以有多个jobs
+env:
+  FLUTTER_VERSION: "3.19.6"
+
 jobs:
   android:
-    # 运行环境 ubuntu-latest window-latest mac-latest
     runs-on: ubuntu-latest
-
-    # 每个jobs中可以有多个steps
     steps:
       - name: 代码迁出
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: 构建Java环境
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: "zulu"
           java-version: "17"
-          token: ${{secrets.GIT_TOKEN}}
-
-      - name: 检查缓存
-        uses: actions/cache@v2
-        id: cache-flutter
-        with:
-          path: /root/flutter-sdk # Flutter SDK 的路径
-          key: ${{ runner.os }}-flutter-${{ hashFiles('**/pubspec.lock') }}
+          cache: gradle
 
       - name: 安装Flutter
-        if: steps.cache-flutter.outputs.cache-hit != 'true'
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: 3.19.6
-          channel: any
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
 
       - name: 下载项目依赖
         run: flutter pub get
 
       - name: 解码生成 jks
-        run: echo $KEYSTORE_BASE64 | base64 -di > android/app/vvex.jks
+        run: echo "$KEYSTORE_BASE64" | base64 --decode > android/app/vvex.jks
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
 
-      - name: flutter build apk
+      - name: flutter build apk (split per abi)
         run: flutter build apk --release --split-per-abi
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD}}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
-      - name: flutter build apk
+      - name: flutter build apk (universal)
         run: flutter build apk --release
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD}}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
       - name: 获取版本号
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >>$GITHUB_OUTPUT
-
-      # - name: 获取当前日期
-      #   id: date
-      #   run: echo "date=$(date +'%m%d')" >>$GITHUB_OUTPUT
-
-      - name: 重命名应用
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          # DATE=${{ steps.date.outputs.date }}
-          for file in build/app/outputs/flutter-apk/app-*.apk; do
-            if [[ $file =~ app-(.?*)release.apk ]]; then
-              new_file_name="build/app/outputs/flutter-apk/Pili-${BASH_REMATCH[1]}${{ steps.version.outputs.version }}.apk"
-              mv "$file" "$new_file_name"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${INPUT_TAG}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+
+      - name: 重命名 APK
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          OUTDIR="build/app/outputs/flutter-apk"
+          for file in "$OUTDIR"/app-*-release.apk "$OUTDIR"/app-release.apk; do
+            [ -e "$file" ] || continue
+            base=$(basename "$file")
+            if [[ "$base" == "app-release.apk" ]]; then
+              prefix=""
+            else
+              abi="${base#app-}"
+              abi="${abi%-release.apk}"
+              prefix="${abi}-"
             fi
+            mv "$file" "$OUTDIR/Pili-${prefix}${VERSION}.apk"
           done
 
-      - name: 上传
-        uses: actions/upload-artifact@v3
+      - name: 上传 Android 产物
+        uses: actions/upload-artifact@v4
         with:
-          name: Pilipala-Release
-          path: |
-            build/app/outputs/flutter-apk/Pili-*.apk
+          name: android-apk
+          path: build/app/outputs/flutter-apk/Pili-*.apk
+          if-no-files-found: error
 
-  iOS:
+  ios:
     runs-on: macos-latest
-
     steps:
       - name: 代码迁出
         uses: actions/checkout@v4
 
       - name: 安装Flutter
-        if: steps.cache-flutter.outputs.cache-hit != 'true'
-        uses: subosito/flutter-action@v2.10.0
+        uses: subosito/flutter-action@v2
         with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
-          flutter-version: 3.19.6
 
-      - name: flutter build ipa
+      - name: 下载项目依赖
+        run: flutter pub get
+
+      - name: flutter build ipa（no codesign）
         run: |
-          flutter build ios --release --no-codesign 
-          ln -sf ./build/ios/iphoneos Payload
-          zip -r9 app.ipa Payload/runner.app
+          flutter build ios --release --no-codesign
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          (cd Payload && zip -r ../app.ipa Runner.app)
 
       - name: 获取版本号
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >>$GITHUB_OUTPUT
-
-      - name: 重命名应用
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          DATE=${{ steps.date.outputs.date }}
-          for file in app.ipa; do
-            new_file_name="build/Pili-${{ steps.version.outputs.version }}.ipa"
-            mv "$file" "$new_file_name"
-          done
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${INPUT_TAG}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
 
-      - name: 上传
-        uses: actions/upload-artifact@v3
+      - name: 重命名 IPA
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p build
+          mv app.ipa "build/Pili-${VERSION}.ipa"
+
+      - name: 上传 iOS 产物
+        uses: actions/upload-artifact@v4
         with:
+          name: ios-ipa
+          path: build/Pili-*.ipa
           if-no-files-found: error
-          name: Pilipala-Release
-          path: |
-            build/Pili-*.ipa
 
   upload:
     runs-on: ubuntu-latest
-
-    needs:
-      - android
-      - iOS
+    needs: [android, ios]
     steps:
-      - uses: actions/download-artifact@v3
+      - name: 下载 Android 产物
+        uses: actions/download-artifact@v4
         with:
-          name: Pilipala-Release
-          path: ./Pilipala-Release
+          name: android-apk
+          path: release
 
-      - name: Install dependencies
-        run: sudo apt-get install tree -y
+      - name: 下载 iOS 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-ipa
+          path: release
 
-      - name: Get version
+      - name: 查看产物
+        run: |
+          ls -lah release
+          find release -maxdepth 2 -type f -print
+
+      - name: 获取版本号
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >>$GITHUB_OUTPUT
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${INPUT_TAG}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
 
       - name: Upload Release
         uses: ncipollo/release-action@v1
         with:
           name: v${{ steps.version.outputs.version }}
+          tag: v${{ steps.version.outputs.version }}
           token: ${{ secrets.GIT_TOKEN }}
+          allowUpdates: true
           omitBodyDuringUpdate: true
           omitNameDuringUpdate: true
           omitPrereleaseDuringUpdate: true
-          allowUpdates: true
-          artifacts: Pilipala-Release/*
+          artifacts: release/*
